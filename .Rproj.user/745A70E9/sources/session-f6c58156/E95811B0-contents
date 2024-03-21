@@ -1,0 +1,465 @@
+
+# config ------------------------------------------------------------------
+
+
+source("./code/utility.R")
+
+load("./Result/COAD/inted/GEOintes.Rdata")
+
+metaInte$setTarget("metaOrNot")
+
+mrnaTCGA = metaInte$reInte("mRNA")
+mrnaTCGA$phen$metaOrNot = ifelse(mrnaTCGA$phen$metastasis_num > 1, 1, 0)
+
+intesGEO = list(inteGSE17536, inteGSE29621, inteGSE38832, inteGSE39582, mrnaTCGA)
+names(intesGEO) = c("GSE17536", "GSE29621", "GSE38832", "GSE39582", "TCGA")
+metaInteGEO = metaIntegration$new(intesGEO, "metaOrNot")
+metaInteGEO$setRules(".getSamples", loadAll)
+
+metaInteGEO$align(bySample_ = F)
+
+reduceIntersect = function(...) Reduce(intersect, list(...))
+
+geneModule = readRDS("./Result/COAD/WGCNA/geneModule.Rds")
+
+calOR = function(target_, fea_) {
+  
+  data_ = data.frame(y = target_, x = fea_)
+  fit_  = tryCatch(
+    expr  = glm(y ~ x, data = data_, family = "binomial"), 
+    error = function(e) {c(1, 1, 1, 1)}, 
+    warning = function(w) {c(1, 1, 1, 1)}
+  )
+  
+  if (is.vector(fit_)) return(setNames(fit_, c("OR", "low", "high", "p")))
+  
+  result_ = fit_ |> 
+    broom::tidy(conf.int = T, conf.level = 0.95) |> 
+    dplyr::slice(2) |> 
+    dplyr::select(OR = estimate, low = conf.low, high = conf.high, p = p.value) |> 
+    mutate(across(1:3, exp)) |> 
+    unlist()
+  
+  return(result_)
+  
+}
+
+pToSig = function(vec_) {
+  vec_[is.na(vec_)] = 1
+  cut(
+    vec_,
+    breaks = c(-Inf, 0.001, 0.01, 0.05, 0.1, Inf),
+    labels = c("***", "** ", "*  ", "-   ", "    ") 
+  )
+}
+
+# KEGG = clusterProfiler:::get_data_from_KEGG_db("hsa")
+
+# Analysis ----------------------------------------------------------------
+
+## Differential Analysis-wilcoxon ----
+
+p_GEO = metaInteGEO$apply(have(asFormula(wilcox.test), "p.value"), nThreads_ = 4)
+
+filterdP = lapply(
+  p_GEO, 
+  \(each_) {
+    each_ |> 
+      mutate(padj = p.adjust(V1, "fdr")) |> 
+      filter(padj < 0.2)
+  }
+)
+
+# geneModule = fread("./Result/COAD/WGCNA/genemodule.csv"); geneModule = setNames(geneModule$module, geneModule$genes)
+# lightcyan  = geneModule$genes[geneModule$module == "lightcyan"]
+
+lightcyanGF = metaInte$extract(lightcyanSYMBOL)
+lightcyanGF$view(useTargetFor_ = "correlation")
+
+
+sigGenes = intersect(filterdP$TCGA$feature, filterdP$GSE39582$feature)
+table(geneModule[sigGenes])
+
+# sigGenes = reduceIntersect(x$TCGA$feature, x$GSE39582$feature, x$GSE17536$feature)
+
+KEGGDRGenes = KEGG$PATHID2EXTID$hsa03030 |> 
+  bitr(fromType = "ENTREZID", toType = "SYMBOL", OrgDb = "org.Hs.eg.db") |> 
+  pull(SYMBOL)
+
+KEGGCCGenes = KEGG$PATHID2EXTID$hsa04110 |> 
+  bitr(fromType = "ENTREZID", toType = "SYMBOL", OrgDb = "org.Hs.eg.db") |> 
+  pull(SYMBOL)
+
+intersect(KEGGCCGenes, lightcyanSYMBOL)
+
+names(geneModule[sigGenes][geneModule[sigGenes] == "darkorange"])
+lightcyanGenesSig = names(geneModule[sigGenes][geneModule[sigGenes] == "lightcyan"])
+
+# metaInte$extract(names(geneModule[sigGenes][geneModule[sigGenes] != "blue"]))$view(useTargetFor_ = "correlation")
+
+genes = metaInteGEO$extract(sigGenes)
+
+genes$getValue() |> 
+  rbindlist() |> 
+  melt(id = c("sample", "gene", "metaOrNot"), measure = 1:5, value.name = "value", na.rm = T) |> 
+  group_by(gene, variable) |> 
+  summarise(fc = mean(value[metaOrNot == 1]) / mean(value[metaOrNot == 0])) |> 
+  View()
+
+p_GEO[["TCGA"]] |> 
+  mutate(padj = p.adjust(V1, "fdr")) |> 
+  filter(padj < 0.1)
+
+## Differential Analysis-limma ----
+
+library(limma)
+library(clusterProfiler)
+
+hallmark = read.gmt("./data/reference/h.all.v2023.2.Hs.symbols.gmt") |> 
+  as_tibble() |> 
+  mutate(term = str_sub(term, 10) |> str_replace_all("_", " ") |> str_to_title())
+
+limma = function(target_, data_) {
+  
+  mat_ = t(data_)
+  
+  designMatrix_ = model.matrix(~ factor(target_) + 0)
+  colnames(designMatrix_) = c("metastasis", "not")
+  
+  dfFit_ = lmFit(mat_, designMatrix_)
+  
+  dfMatrix_ = makeContrasts(metastasis - not, levels = designMatrix_)
+  limmaFit_ = contrasts.fit(dfFit_, dfMatrix_)
+  limmaFit_ = eBayes(limmaFit_)
+  
+  topTable(limmaFit_, n = Inf, adjust = "fdr")
+  
+}
+
+limmaGEO = metaInteGEO$do(limma, return_ = T, sampleAsRowname_ = T, target_ = "metaOrNot")
+genelst = limmaGEO |> 
+  lapply(as_tibble, rownames = "gene") |> 
+  imap(\(data_, dataset_) data_ |> mutate(dataset = dataset_)) |>
+  lapply(\(data_) data_ |> arrange(-logFC) |> pull(logFC, gene))
+
+# hallGSEA = lapply(genelst, GSEA, TERM2GENE = hallmark, verbose = F, pvalueCutoff = 0.99)
+# saveRDS(hallGSEA, "Result/test/GSEA.Rds")
+
+hallGSEA$TCGA@result |> View()
+hallGSEA$GSE39582@result |> View()
+hallGSEA$GSE29621@result |> View()
+hallGSEA$GSE17536@result |> View()
+
+library(enrichplot)
+library(aplot)
+
+plotGSEA = function(gsea_, term_) {
+  
+  geneSetID_ = which(gsea_@result$ID == term_)
+  
+  FDR_ = paste0("False Discovery Rate = ", signif(gsea_@result$qvalue[geneSetID_], 3))
+  
+  gsdata_ = enrichplot:::gsInfo(gsea_, geneSetID_)
+  
+  p1_ = gsdata_ |>
+    as_tibble() |> 
+    ggplot(aes(x = x)) + 
+    geom_segment(aes(xend = x, y = 0, yend = -runningScore, color = x), linewidth = 0.1, data = subset(gsdata_, position == 1)) + 
+    theme_void() + 
+    scale_x_continuous(expand = c(0, 0)) + 
+    scale_y_continuous(expand = c(0, 0), breaks = NULL) +
+    scale_color_gradient(low = "#394c81", high = "#94697a") +
+    xlab(NULL) + 
+    ylab(NULL) + 
+    labs(title = term_, subtitle = FDR_) +
+    theme(
+      legend.position = "none", 
+      plot.margin = margin(t = -0.1, b = 0, unit = "cm"), 
+      axis.ticks = element_blank(), 
+      axis.text = element_blank(), 
+      axis.line.x = element_blank(), 
+      plot.title = element_text(hjust = 1), 
+      plot.subtitle = element_text(hjust = 1)
+    ) 
+  
+  p2_ = gsdata_ |> 
+    ggplot(aes(x, y = 1, fill = x)) +
+    geom_tile() + 
+    theme_void() +
+    scale_fill_gradient(low = "#394c81", high = "#94697a") +
+    aplot::xlim2(p1_) +
+    theme(
+      legend.position = "none"
+    )
+  
+  p1_ |> 
+    aplot::insert_bottom(p2_, height = 0.05)
+  
+}
+
+# plotGSEA(hallGSEA$GSE17536, "Epithelial Mesenchymal Transition")
+# plotGSEA(hallGSEA$GSE29621, "Epithelial Mesenchymal Transition")
+# plotGSEA(hallGSEA$GSE39582, "Epithelial Mesenchymal Transition")
+# 
+# plotGSEA(hallGSEA$GSE17536, "G2m Checkpoint")
+# plotGSEA(hallGSEA$GSE29621, "G2m Checkpoint")
+# plotGSEA(hallGSEA$GSE39582, "G2m Checkpoint")
+# 
+# plotGSEA(hallGSEA$GSE17536, "Dna Repair")
+# plotGSEA(hallGSEA$GSE29621, "Dna Repair")
+# plotGSEA(hallGSEA$GSE39582, "Dna Repair")
+
+lstPlot = list(
+  EMT = plotGSEA(hallGSEA$GSE29621, "Epithelial Mesenchymal Transition"),
+  DP  = plotGSEA(hallGSEA$GSE29621, "Dna Repair"),
+  G2m = plotGSEA(hallGSEA$GSE29621, "G2m Checkpoint")
+)
+
+# map2(names(lstPlot), lstPlot, ~ ggsave(paste0("./Result/COAD/mRNA/GSEA", .y, ".pdf"), .x, width = 8, height = 4))
+
+for (i in seq_along(names(lstPlot))) {
+  
+  print(i)
+  ggsave(paste0("./Result/COAD/mRNA/GSEA", names(lstPlot)[[i]], ".pdf"), lstPlot[[i]], width = 8, height = 4)
+  
+}
+
+## Risk Genes ----
+
+# ORs = metaInteGEO$apply(calOR, nThreads_ = 5)
+
+ORsFiltered = lapply(
+  ORs, 
+  \(each_) {
+    each_ |> 
+      filter(p < 0.05)
+  }
+)
+
+riskGenes = reduceIntersect(ORsFiltered$TCGA$feature, ORsFiltered$GSE39582$feature)
+
+riskEnrich = enrichment_of(riskGenes)
+riskEnrichKEGG = enrichment_of(riskGenes, "KEGG") 
+
+ORsFiltered = lapply(
+  ORs, 
+  \(each_) {
+    each_ |> 
+      filter(feature %in% riskGenes)
+  }
+)
+
+names(geneModule[riskGenes][geneModule[riskGenes] == "lightcyan"])
+names(geneModule[riskGenes][geneModule[riskGenes] == "cyan"])
+
+Allmarker$cluster |> unique()
+
+intersect(Allmarker$gene[Allmarker$cluster == "Myeloid"], riskGenes)
+intersect(Allmarker$gene[Allmarker$cluster == "Epithelial"], riskGenes)
+intersect(Allmarker$gene[Allmarker$cluster == "T cells"], riskGenes)
+
+geneModule[intersect(Allmarker$gene[Allmarker$cluster == "Myeloid"], riskGenes)] |> table()
+geneModule[intersect(Allmarker$gene[Allmarker$cluster == "Epithelial"], riskGenes)] |> table()
+geneModule[intersect(Allmarker$gene[Allmarker$cluster == "T cells"], riskGenes)] |> table()
+
+# Enrichment
+
+geneLstOf = function(cellType_) {
+  
+  list(
+    act = intersect(Allmarker$gene[Allmarker$cluster == cellType_ & Allmarker$avg_log2FC > 0], riskGenes), 
+    sup = intersect(Allmarker$gene[Allmarker$cluster == cellType_ & Allmarker$avg_log2FC < 0], riskGenes)
+  )
+  
+}
+
+enrichMld = geneLstOf("Myeloid") |> lapply(enrichment_of)
+enrichEpi = geneLstOf("Epithelial") |> lapply(enrichment_of)
+
+barPlotPlus = function(enrichLst_, nTerms_ = 7) {
+  
+  pToLabel_ = function(vec__) {
+    vec__[is.na(vec__)] = 1
+    cut(
+      vec__,
+      breaks = c(-Inf, 0.0001, 0.001, 0.01, 0.05, Inf),
+      labels = c("FDR<0.0001", "FDR<0.001", "FDR<0.01", "FDR<0.05", " - ") 
+    )
+  }
+  
+  splitTerms_ = function(Des__) {
+    
+    DesVec__ = str_split(Des__, " ", simplify = F)[[1]]
+    cutPoint__ = ceiling(length(DesVec__)/2)
+    
+    DesVec1__ = DesVec__[2:cutPoint__-1]; DesVec2__ = DesVec__[cutPoint__:length(DesVec__)]
+    
+    paste0(paste(DesVec1__, collapse = " "), "\n", paste(DesVec2__, collapse = " "))
+    
+  }
+  
+  enrichLst_$act@result$type = "Activated"
+  enrichLst_$sup@result$type = "Suppressed"
+  
+  evalParse_ = \(x__) eval(parse(text = x__))
+  
+  dataPlot_ = enrichLst_ |> 
+    lapply(
+      \(each__) each__@result |> 
+        filter(qvalue < 0.05) |> 
+        mutate(GeneRatio = sapply(GeneRatio, evalParse_)) |> 
+        slice_max(-qvalue, n = nTerms_) |> 
+        arrange(GeneRatio) |> 
+        mutate(Description = capitalize(Description), 
+               Description = map_chr(Description, ~ ifelse(str_count(.x, " ") > 3, splitTerms_(.x), .x)), 
+               Description = factor(Description, levels = Description), 
+               qvalue = pToLabel_(qvalue))
+    ) |> bind_rows() 
+  
+  dataPlot_ |> 
+    ggplot() +
+    geom_col(aes(GeneRatio, Description, fill = qvalue)) +
+    # geom_text(aes(GeneRatio, Description, label = Count)) +
+    scale_fill_manual(values = c("FDR<0.0001" = "#4e62ab", "FDR<0.001" = "#479db4", "FDR<0.01" = "#87d0a6", "FDR<0.05" = "#cbe99d", " - " = "#f7fbae")) +
+    facet_wrap(~ type, nrow = 2, scales = "free_y") +
+    theme_bw() +
+    ylab("")
+  
+}
+
+ggsave("./Result/COAD/scRNA/enrichMld.pdf", barPlotPlus(enrichMld), width = 6, height = 6)
+ggsave("./Result/COAD/scRNA/enrichEpi.pdf", barPlotPlus(enrichEpi), width = 6, height = 6)
+barPlotPlus(enrichMld)
+
+# Heatmap
+
+ORsFiltered = lapply(
+  ORs, 
+  \(each_) {
+    each_ |> 
+      filter(p < 0.1)
+  }
+)
+
+riskN = reduceIntersect(ORsFiltered$TCGA$feature, ORsFiltered$GSE39582$feature, ORsFiltered$GSE38832$feature, ORsFiltered$GSE17536$feature)
+
+dataPlotPre = imap(
+  ORs, 
+  \(each_, idx_) {
+    each_ |> 
+      filter(feature %in% riskN) |> 
+      mutate(dataset = idx_)
+  }
+) |> bind_rows() |> 
+  filter(dataset != "GSE29621") |> 
+  # filter(dataset != "GSE17536") |> 
+  # filter(dataset != "GSE38832") |> 
+  mutate(across(c(OR, low, high), log2))
+
+toPlot = dataPlotPre |> 
+  group_by(feature) |> 
+  summarise(pMean = mean(p), trend = all(OR > 0) | all(OR < 0)) |> 
+  filter(trend) |> 
+  slice_max(-pMean, n = 50); toPlot = toPlot$feature
+
+datasetWithN = metaInteGEO$infos$omicsDim[dataPlotPre$dataset |> unique()] |> 
+  imap(\(x_, ind_) paste0(ind_, "\n(n=", x_[1], ")")) |> 
+  unlist()
+
+dataPlot = dataPlotPre |> 
+  filter(feature %in% toPlot) |> 
+  group_by(dataset) |> 
+  arrange(OR) |> 
+  mutate(feature = factor(feature, levels = feature), 
+         OR = pmax(pmin(OR, 4), -4), 
+         dataset = datasetWithN[dataset])
+
+pOR = ggplot() +
+  geom_point(data = dataPlot |> filter(p < 0.05), aes(feature, dataset, fill = OR), shape = 21, size = 6) +
+  geom_point(data = dataPlot |> filter(p > 0.05), aes(feature, dataset, color = OR), size = 6) +
+  # geom_text(aes(feature, dataset, label = trimws(pToSig(p))), color = "black") +
+  scale_color_gradient2(limits = c(-4, 4), low = "#01665e", mid = "white", high = "#8c510a", midpoint = 0) +
+  scale_fill_gradient2(limits = c(-4, 4), low = "#01665e", mid = "white", high = "#8c510a", midpoint = 0) +
+  ylab("") +
+  xlab("") +
+  labs(color = "log2(OR)", fill = "log2(OR)") +
+  theme_classic() +
+  theme(
+    plot.title = element_text(hjust = 0.5), 
+    axis.text.x = element_text(angle = 30, vjust = 0.85, hjust = 0.75), 
+    legend.position = "top"
+  )
+
+ggsave("./Result/COAD/WGCNA/OR_mRNA.pdf", pOR, width = 12, height = 4)
+
+# dataPlot |> 
+#   filter(feature %in% toPlot) |> 
+#   group_by(dataset) |> 
+#   arrange(OR) |> 
+#   mutate(feature = factor(feature, levels = feature)) |> 
+#   ggplot(aes(OR, feature)) +
+#   geom_errorbar(aes(xmin = low, xmax = high)) +
+#   geom_point() + 
+#   # xlim(-4, 4) +
+#   geom_vline(xintercept = 0, lty = 2) +
+#   facet_wrap(~ dataset, nrow = 1) + 
+#   theme_bw() +
+#   ylab("") +
+#   xlab("log2(OR)")
+
+# Survival Analysis
+
+library(GSVA)
+ligtcyanGenes = names(geneModule)[geneModule == "lightcyan"]
+
+ssGSEA = function(data_, geneSet_ = ligtcyanGenes) {
+  
+  result_ = gsva(t(data_), list(Score = geneSet_), method = "ssgsea", mx.diff = F, verbose = F) 
+  result_ |> 
+    t() |> 
+    as_tibble(rownames = "sample")
+  
+}
+
+lightcyanScore = metaInteGEO$do(ssGSEA, return_ = T, sampleAsRowname_ = T) |> bind_rows()
+lightcyanScore = bind_rows(lightcyanScore)
+
+metaInteGEO$cbind(lightcyanScore)
+
+library(survminer)
+phenGEO = metaInteGEO$phen
+phenGEO$Score = as.numeric(phenGEO$Score)
+
+phens = split(phenGEO, phenGEO$distinct)
+phenGSE17536 = phens$GSE17536
+
+lstResult = list()
+for (i in seq_along(phens)) {
+  
+  eachPhen = phens[[i]]
+
+  cutPoint = surv_cutpoint(eachPhen |> filter(!is.na(DFI_time)), time = "DFI_time", event = "DFI", variables = c("Score"))
+  eachPhen$group = ifelse(eachPhen$Score > cutPoint$cutpoint[[1]], "H+M", "L")
+  
+  dataHR = survdiff(Surv(event = DFI, time = DFI_time) ~ group, data = eachPhen)
+  HR = signif((dataHR$obs[2]/dataHR$exp[2])/(dataHR$obs[1]/dataHR$exp[1]), 3)
+  pValue = signif(1 - pchisq(dataHR$chisq, length(dataHR$n) - 1), 3)
+  
+  fitSurv = survfit(Surv(event = DFI, time = DFI_time) ~ group, data = eachPhen)
+  
+  lstPlot = ggsurvplot(fitSurv, data = eachPhen)
+  
+  statistic = paste0("H+M : L = ", paste(table(eachPhen |> filter(!is.na(DFI_time)) |> pull(group)), collapse = ":"), "\n", "Hazard Ratio = ", HR, "\nLog-Rank Pvalue = ", pValue)
+  lstResult[[names(phens)[i]]] = 
+    lstPlot$plot +
+    scale_color_manual(values = c(`group=H+M` = "#F08080", `group=L` = "#4169E1")) +
+    labs(color = "Function Level") +
+    annotate("text", label = statistic, x = 0, y = 0, hjust = 0, vjust = 0.1) + 
+    annotate("text", label = names(phens)[i], x = 0, y = 1, hjust = -1.5, size = 5) + 
+    theme(
+      legend.position = "right"
+    )
+  
+}
+
+walk2(names(lstResult), lstResult, ~ ggsave(paste0("Result/COAD/mRNA/", .x, ".pdf"), .y, width = 5, height = 4))

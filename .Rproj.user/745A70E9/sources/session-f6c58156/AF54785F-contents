@@ -1,0 +1,56 @@
+
+# config ------------------------------------------------------------------
+
+source("./code/utility.R")
+
+library(ggsci)
+library(patchwork)
+library(aplot)
+
+geneModule = readRDS('./Result/COAD/WGCNA/geneModule.Rds'); geneModule = tibble(gene = names(geneModule), module = geneModule)
+genesFromCell = read_csv("./Result/COAD/immune/geneFromCell.csv") |> select(gene, cell)
+
+cellAbbr = setNames(c("Mucosa Fib", "Epithelial", "Stromal", "Leukocytes"), unique(genesFromCell$cell))
+
+# vis ---------------------------------------------------------------------
+
+moduleAndCell = inner_join(geneModule, genesFromCell, by = "gene")
+
+dataPlot = moduleAndCell |> 
+  group_by(module) |> 
+  count(cell) |> 
+  mutate(cell = factor(cellAbbr[cell], levels = ), 
+         ratio = signif(n/sum(n), 3), 
+         label = ifelse(ratio > 0.15, paste0((ratio*100), "%"), NA)) |> 
+  arrange(module, cell) |> 
+  group_by(module) |> 
+  mutate(textTop = rev(cumsum(rev(ratio))), textBottom = textTop - ratio) |> 
+  ungroup()
+
+barPlot = dataPlot |> 
+  ggplot() +
+  geom_bar(aes(module, n, fill = cell), color = "#f3f4f4", position = "fill", stat = "identity", size = 1) +
+  geom_text(aes(module, (textTop + textBottom)/2, label = label), size = 3, color = "white") +
+  scale_y_continuous(labels = paste0(100*seq(0, 1, 0.25), "%")) +
+  scale_fill_manual(values = c("#F19294", "#A5D38F", "#96C3D8", "#5F9BBE")) +
+  xlab("") +
+  ylab("") +
+  labs(fill = NULL) +
+  theme_classic() +
+  theme(
+    legend.position = "top", 
+    axis.text.x = element_text(angle = 30, vjust = 0.5, hjust = 0.75)
+  )
+
+pointPlot = dataPlot |> 
+  ggplot() +
+  geom_point(aes(module, 1, fill = module), size = 5, color = "black", shape = 21) +
+  scale_fill_identity() + 
+  theme_void() +
+  theme(
+    legend.position = "none"
+  )
+
+combinedPlot = barPlot + pointPlot + plot_layout(ncol = 1, heights = c(10, 1))
+
+ggsave("./Result/COAD/WGCNA/moduleAndCell.pdf", combinedPlot, width = 14, height = 7)
